@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!Dockerfile.web
+!pyproject.toml
+!uv.lock
+!requirements-voice.txt
+!src/
+!src/**
+**/__pycache__/

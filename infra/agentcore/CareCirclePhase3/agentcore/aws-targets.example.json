@@ -1,0 +1,8 @@
+[
+  {
+    "name": "default",
+    "description": "CareCircle hackathon deployment target",
+    "account": "<AWS_ACCOUNT_ID>",
+    "region": "us-east-1"
+  }
+]

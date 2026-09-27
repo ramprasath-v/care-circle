@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CareCircle Phase 3 least-privilege AgentCore runtime role and temporary,
+  project-scoped CDK deployment policy. This stack creates IAM resources only;
+  it does not deploy CareCircle.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: CareCircle
+  EnvironmentName:
+    Type: String
+    Default: Hackathon
+  EcrRepositoryName:
+    Type: String
+    Default: carecirclephase3/carecirclemcp
+
+Resources:
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CareCirclePhase3AgentCoreRuntimeRole
+      Description: Least-privilege execution role for the CareCircle AgentCore runtime
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: CareCirclePhase3Runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeClaudeSonnet46UsInferenceProfile
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:us-east-1:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-6
+                  - !Sub arn:${AWS::Partition}:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6
+                  - !Sub arn:${AWS::Partition}:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-4-6
+                  - !Sub arn:${AWS::Partition}:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-6
+              - Sid: PullCareCircleImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}
+              - Sid: GetEcrAuthorizationToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: DescribeRuntimeLogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+              - Sid: ManageRuntimeLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:PutResourcePolicy
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*
+              - Sid: WriteRuntimeLogStreams
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*
+              - Sid: PublishAgentCoreTraces
+                Effect: Allow
+                Action:
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - xray:PutTelemetryRecords
+                  - xray:PutTraceSegments
+                Resource: "*"
+              - Sid: PublishAgentCoreMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: ReadWriteCareCircleProfiles
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/CareCircleCareProfiles
+              - Sid: ReadWriteCareCircleEvents
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/CareCircleCareEvents
+              - Sid: ReadWriteCareCircleLedger
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/CareCircleActionLedger
+              - Sid: PublishCareCircleCaregiverAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:CareCircleCaregiverAlerts
+              - Sid: ScheduleCareCircleFollowUps
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:GetSchedule
+                Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/carecircle-*
+              - Sid: PassCareCircleSchedulerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CareCircleFollowUpSchedulerRole
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  CdkExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: CareCirclePhase3CdkExecutionPolicy
+      Description: Permissions used by CloudFormation only for the CareCircle Phase 3 stack
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageCareCircleEcrRepository
+            Effect: Allow
+            Action: ecr:*
+            Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}
+          - Sid: CreateTaggedCareCircleKmsKey
+            Effect: Allow
+            Action: kms:CreateKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestTag/Project: !Ref ProjectName
+                aws:RequestTag/Environment: !Ref EnvironmentName
+          - Sid: ManageTaggedCareCircleKmsKey
+            Effect: Allow
+            Action:
+              - kms:CreateGrant
+              - kms:DescribeKey
+              - kms:DisableKey
+              - kms:DisableKeyRotation
+              - kms:EnableKey
+              - kms:EnableKeyRotation
+              - kms:GetKeyPolicy
+              - kms:GetKeyRotationStatus
+              - kms:ListResourceTags
+              - kms:PutKeyPolicy
+              - kms:ScheduleKeyDeletion
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:UpdateKeyDescription
+            Resource: !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Project: !Ref ProjectName
+                aws:ResourceTag/Environment: !Ref EnvironmentName
+          - Sid: ManageCareCircleGeneratedRoles
+            Effect: Allow
+            Action: iam:*
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AgentCore-CareCirclePhase-*
+          - Sid: PassCareCircleRuntimeRoleToAgentCore
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt RuntimeRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: bedrock-agentcore.amazonaws.com
+          - Sid: CreateAgentCoreRuntimeIdentityServiceLinkedRole
+            Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/runtime-identity.bedrock-agentcore.amazonaws.com/AWSServiceRoleForBedrockAgentCoreRuntimeIdentity
+            Condition:
+              StringEquals:
+                iam:AWSServiceName: runtime-identity.bedrock-agentcore.amazonaws.com
+          - Sid: ManageCareCircleLambda
+            Effect: Allow
+            Action: lambda:*
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:AgentCore-CareCirclePhase-ApplicationAgentCareCirc-*
+          - Sid: ManageCareCircleLambdaLogs
+            Effect: Allow
+            Action: logs:*
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/AgentCore-CareCirclePhase-ApplicationAgentCareCirc-*
+          - Sid: ManageCareCircleCodeBuildProject
+            Effect: Allow
+            Action: codebuild:*
+            Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/AgentCore-CareCirclePhase3-default-container-builder
+          - Sid: ManageAgentCoreDeploymentLifecycle
+            Effect: Allow
+            Action: bedrock-agentcore:*
+            Resource: "*"
+          - Sid: ReadCdkFileAssets
+            Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:${AWS::Partition}:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}/*
+          - Sid: ReadCdkBootstrapVersion
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/hnb659fds/version
+
+Outputs:
+  RuntimeRoleArn:
+    Description: Add this ARN as executionRoleArn for the local AgentCore deployment.
+    Value: !GetAtt RuntimeRole.Arn
+  CdkExecutionPolicyArn:
+    Description: Pass this ARN to cdk bootstrap --cloudformation-execution-policies.
+    Value: !Ref CdkExecutionPolicy

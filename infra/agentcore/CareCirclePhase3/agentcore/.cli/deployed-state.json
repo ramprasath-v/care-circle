@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "default": {
+      "resources": {
+        "runtimes": {
+          "CareCircleMcp": {
+            "runtimeId": "CareCirclePhase3_CareCircleMcp-XjLaBWDGYa",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:109837542034:runtime/CareCirclePhase3_CareCircleMcp-XjLaBWDGYa",
+            "roleArn": "arn:aws:iam::109837542034:role/CareCirclePhase3AgentCoreRuntimeRole"
+          }
+        },
+        "stackName": "AgentCore-CareCirclePhase3-default",
+        "deployHash": "ec5c83cf3959e9fc"
+      }
+    }
+  }
+}

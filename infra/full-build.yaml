@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CareCircle hackathon persistence, caregiver alert, and one-shot follow-up resources
+Resources:
+  CareProfiles:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CareCircleCareProfiles
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: household_id, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: household_id, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      Tags: [{Key: Project, Value: CareCircle}, {Key: Environment, Value: Hackathon}]
+  CareEvents:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CareCircleCareEvents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: household_id, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: household_id, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      Tags: [{Key: Project, Value: CareCircle}, {Key: Environment, Value: Hackathon}]
+  ActionLedger:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CareCircleActionLedger
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: incident_id, AttributeType: S}
+        - {AttributeName: action_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: incident_id, KeyType: HASH}
+        - {AttributeName: action_id, KeyType: RANGE}
+      Tags: [{Key: Project, Value: CareCircle}, {Key: Environment, Value: Hackathon}]
+  CaregiverAlerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CareCircleCaregiverAlerts
+      Tags: [{Key: Project, Value: CareCircle}, {Key: Environment, Value: Hackathon}]
+  FollowUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/CareCircleFollowUp
+      RetentionInDays: 30
+      Tags: [{Key: Project, Value: CareCircle}, {Key: Environment, Value: Hackathon}]
+  FollowUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CareCircleFollowUpLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CareCircleFollowUpState
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: [!GetAtt ActionLedger.Arn, !GetAtt CareEvents.Arn]
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt CareProfiles.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CareCircleFollowUp:log-stream:*
+  FollowUpFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FollowUpLogGroup
+    Properties:
+      FunctionName: CareCircleFollowUp
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt FollowUpRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          CARE_EVENTS_TABLE: !Ref CareEvents
+          ACTION_LEDGER_TABLE: !Ref ActionLedger
+          CARE_PROFILES_TABLE: !Ref CareProfiles
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timezone
+          import boto3
+          from botocore.exceptions import ClientError
+
+          db = boto3.resource('dynamodb')
+          ledger = db.Table(os.environ['ACTION_LEDGER_TABLE'])
+          events = db.Table(os.environ['CARE_EVENTS_TABLE'])
+          profiles = db.Table(os.environ['CARE_PROFILES_TABLE'])
+
+          def handler(event, context):
+              if 'Records' in event:
+                  for record in event['Records']:
+                      if record.get('EventSource') != 'aws:sns':
+                          continue
+                      attrs = record['Sns']['MessageAttributes']
+                      incident_id = attrs['CareCircleIncidentId']['Value']
+                      household_id = attrs['CareCircleHouseholdId']['Value']
+                      action_id = attrs['CareCircleActionId']['Value']
+                      owner = attrs['CareCircleOwner']['Value']
+                      timestamp = record['Sns'].get('Timestamp', datetime.now(timezone.utc).isoformat())
+                      try:
+                          events.put_item(Item={'household_id': household_id,
+                              'sk': timestamp + '#alert-' + action_id,
+                              'event_id': 'alert-' + action_id,
+                              'payload': json.dumps({'event_id': 'alert-' + action_id,
+                                  'incident_id': incident_id, 'kind': 'caregiver_alert_delivered',
+                                  'owner': owner, 'status': 'delivered_to_demo_inbox',
+                                  'timestamp': timestamp})}, ConditionExpression='attribute_not_exists(sk)')
+                      except ClientError as exc:
+                          if exc.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                              raise
+                  return {'state': 'ALERT_DELIVERED'}
+              incident_id = event['incident_id']
+              household_id = event['household_id']
+              key = {'incident_id': incident_id, 'action_id': 'INCIDENT'}
+              item = ledger.get_item(Key=key).get('Item')
+              if not item:
+                  raise KeyError('UnknownIncident')
+              incident = json.loads(item['payload'])
+              if incident['household_id'] != household_id:
+                  raise ValueError('HouseholdMismatch')
+              if incident['resolution_state'] == 'RESOLVED':
+                  incident['next_check_at'] = None
+                  state = 'CLOSED'
+              else:
+                  if incident.get('status') == 'FOLLOW_UP_DUE' and not incident.get('next_check_at'):
+                      return {'state': 'FOLLOW_UP_DUE', 'incident_id': incident_id}
+                  state = 'FOLLOW_UP_DUE'
+                  incident['status'] = state
+                  incident['next_check_at'] = None
+                  timestamp = datetime.now(timezone.utc).isoformat()
+                  event_id = 'follow-up-' + incident_id
+                  try:
+                      events.put_item(Item={
+                          'household_id': household_id,
+                          'sk': timestamp + '#' + event_id,
+                          'event_id': event_id,
+                          'payload': json.dumps({'event_id': event_id, 'incident_id': incident_id,
+                              'kind': 'follow_up', 'status': 'needs_caregiver_check', 'timestamp': timestamp})
+                      })
+                  except ClientError:
+                      raise
+              ledger.update_item(Key=key, UpdateExpression='SET #p = :p',
+                  ExpressionAttributeNames={'#p': 'payload'},
+                  ExpressionAttributeValues={':p': json.dumps(incident)})
+              if state == 'FOLLOW_UP_DUE':
+                  profile_key = {'household_id': household_id, 'sk': 'PROFILE'}
+                  profile_item = profiles.get_item(Key=profile_key).get('Item')
+                  if profile_item:
+                      profile = json.loads(profile_item['payload'])
+                      for task in profile.get('care_tasks', []):
+                          if task['status'] == 'OPEN':
+                              task['status'] = 'ASSIGNED'
+                      profiles.update_item(Key=profile_key, UpdateExpression='SET #p = :p',
+                          ExpressionAttributeNames={'#p': 'payload'},
+                          ExpressionAttributeValues={':p': json.dumps(profile)})
+                  action_id = 'follow-up-escalation'
+                  action = {'incident_id': incident_id, 'action_id': action_id,
+                      'household_id': household_id, 'type': 'caregiver_alert',
+                      'description': 'Ask backup caregiver John to review the unresolved incident.',
+                      'risk_class': 'EXTERNAL_COMMUNICATION', 'approval_required': True,
+                      'approval_state': 'PENDING', 'execution_state': 'PENDING',
+                      'attempts': 0, 'provider_result': None, 'owner': 'john',
+                      'next_follow_up': None,
+                      'payload': {'message': 'CareCircle: please review unresolved incident ' + incident_id + '.'}}
+                  try:
+                      ledger.put_item(Item={'incident_id': incident_id, 'action_id': action_id,
+                          'execution_state': 'PENDING', 'payload': json.dumps(action)},
+                          ConditionExpression='attribute_not_exists(action_id)')
+                  except ClientError as exc:
+                      if exc.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                          raise
+              return {'state': state, 'incident_id': incident_id}
+  CaregiverAlertInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FollowUpFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CaregiverAlerts
+  DemoCaregiverInboxSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: CaregiverAlertInvokePermission
+    Properties:
+      TopicArn: !Ref CaregiverAlerts
+      Protocol: lambda
+      Endpoint: !GetAtt FollowUpFunction.Arn
+  FollowUpSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CareCircleFollowUpSchedulerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default
+      Policies:
+        - PolicyName: InvokeCareCircleFollowUp
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt FollowUpFunction.Arn
+Outputs:
+  CareProfilesTable: {Value: !Ref CareProfiles}
+  CareEventsTable: {Value: !Ref CareEvents}
+  ActionLedgerTable: {Value: !Ref ActionLedger}
+  CaregiverAlertTopicArn: {Value: !Ref CaregiverAlerts}
+  FollowUpFunctionArn: {Value: !GetAtt FollowUpFunction.Arn}
+  FollowUpSchedulerRoleArn: {Value: !GetAtt FollowUpSchedulerRole.Arn}

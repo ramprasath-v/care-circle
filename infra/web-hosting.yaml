@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CareCircle public HTTPS web client on App Runner
+
+Parameters:
+  ImageIdentifier:
+    Type: String
+    Default: ''
+    Description: Full ECR image URI including tag; leave empty for repository and IAM bootstrap.
+
+Conditions:
+  DeployService: !Not [!Equals [!Ref ImageIdentifier, '']]
+
+Resources:
+  WebRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: carecircle/web
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep three web images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+
+  WebEcrAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CareCircleWebEcrAccessRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CareCircleWebInstanceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CareCircleWebRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeExistingCareCircleRuntime
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - arn:aws:bedrock-agentcore:us-east-1:109837542034:runtime/CareCirclePhase3_CareCircleMcp-XjLaBWDGYa
+                  - arn:aws:bedrock-agentcore:us-east-1:109837542034:runtime/CareCirclePhase3_CareCircleMcp-XjLaBWDGYa/runtime-endpoint/DEFAULT
+              - Sid: TranscribeRecordedAudio
+                Effect: Allow
+                Action: transcribe:StartStreamTranscription
+                Resource: '*'
+              - Sid: SynthesizeCareCircleVoice
+                Effect: Allow
+                Action: polly:SynthesizeSpeech
+                Resource: '*'
+              - Sid: ReadExistingRuntimeProgress
+                Effect: Allow
+                Action: logs:FilterLogEvents
+                Resource: arn:aws:logs:us-east-1:109837542034:log-group:/aws/bedrock-agentcore/runtimes/CareCirclePhase3_CareCircleMcp-XjLaBWDGYa-DEFAULT:*
+
+  WebService:
+    Type: AWS::AppRunner::Service
+    Condition: DeployService
+    Properties:
+      ServiceName: carecircle-web
+      InstanceConfiguration:
+        Cpu: 1 vCPU
+        Memory: 2 GB
+        InstanceRoleArn: !GetAtt WebInstanceRole.Arn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+      SourceConfiguration:
+        AutoDeploymentsEnabled: false
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt WebEcrAccessRole.Arn
+        ImageRepository:
+          ImageIdentifier: !Ref ImageIdentifier
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: '8000'
+            RuntimeEnvironmentVariables:
+              - Name: AWS_REGION
+                Value: us-east-1
+              - Name: BEDROCK_MODEL_ID
+                Value: us.anthropic.claude-sonnet-4-6
+              - Name: AGENT_RUNTIME_ARN
+                Value: arn:aws:bedrock-agentcore:us-east-1:109837542034:runtime/CareCirclePhase3_CareCircleMcp-XjLaBWDGYa
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt WebRepository.RepositoryUri
+  InstanceRoleArn:
+    Value: !GetAtt WebInstanceRole.Arn
+  ServiceArn:
+    Condition: DeployService
+    Value: !GetAtt WebService.ServiceArn
+  ServiceUrl:
+    Condition: DeployService
+    Value: !Sub 'https://${WebService.ServiceUrl}'

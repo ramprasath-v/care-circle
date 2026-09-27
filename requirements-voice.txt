@@ -1,0 +1,2 @@
+# Local web server only; the AgentCore image does not need Amazon Transcribe.
+amazon-transcribe==0.6.4

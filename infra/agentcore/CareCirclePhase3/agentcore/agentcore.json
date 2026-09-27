@@ -1,0 +1,95 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "CareCirclePhase3",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "CareCirclePhase3",
+    "Project": "CareCircle",
+    "Environment": "Hackathon"
+  },
+  "runtimes": [
+    {
+      "name": "CareCircleMcp",
+      "build": "Container",
+      "entrypoint": "src/carecircle/app.py",
+      "codeLocation": "../../../",
+      "runtimeVersion": "PYTHON_3_11",
+      "envVars": [
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "BEDROCK_MODEL_ID",
+          "value": "us.anthropic.claude-sonnet-4-6"
+        },
+        {
+          "name": "SUPERVISOR_TIMEOUT_SECONDS",
+          "value": "60"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "INFO"
+        },
+        {
+          "name": "CARE_PROFILES_TABLE",
+          "value": "CareCircleCareProfiles"
+        },
+        {
+          "name": "CARE_EVENTS_TABLE",
+          "value": "CareCircleCareEvents"
+        },
+        {
+          "name": "ACTION_LEDGER_TABLE",
+          "value": "CareCircleActionLedger"
+        },
+        {
+          "name": "CAREGIVER_ALERT_TOPIC_ARN",
+          "value": "arn:aws:sns:us-east-1:000000000000:CareCircleCaregiverAlerts"
+        },
+        {
+          "name": "FOLLOW_UP_LAMBDA_ARN",
+          "value": "arn:aws:lambda:us-east-1:000000000000:function:CareCircleFollowUp"
+        },
+        {
+          "name": "FOLLOW_UP_SCHEDULER_ROLE_ARN",
+          "value": "arn:aws:iam::000000000000:role/CareCircleFollowUpSchedulerRole"
+        },
+        {
+          "name": "DEMO_MODE",
+          "value": "true"
+        }
+      ],
+      "networkMode": "PUBLIC",
+      "instrumentation": {
+        "enableOtel": true
+      },
+      "protocol": "MCP",
+      "authorizerType": "AWS_IAM",
+      "executionRoleArn": "arn:aws:iam::000000000000:role/CareCirclePhase3AgentCoreRuntimeRole",
+      "tags": {
+        "Project": "CareCircle",
+        "Environment": "Hackathon"
+      },
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 300,
+        "maxLifetime": 900
+      }
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "capacityProviders": [],
+  "payments": []
+}

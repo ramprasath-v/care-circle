@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+COPY --from=ghcr.io/astral-sh/uv:0.12.16 /uv /usr/local/bin/uv
+WORKDIR /app
+COPY pyproject.toml uv.lock requirements-voice.txt ./
+COPY src ./src
+RUN uv sync --frozen --no-dev --no-editable && uv pip install -r requirements-voice.txt
+ENV PATH="/app/.venv/bin:$PATH"
+EXPOSE 8000
+CMD ["uvicorn", "carecircle.web:create_web_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

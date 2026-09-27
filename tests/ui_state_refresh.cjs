@@ -105,6 +105,12 @@ const context = vm.createContext({
           } else if (utterance.includes('john checked')) {
             tool = 'record_dose_status';
             state.medication_status = 'taken'; state.care_task_status = 'COMPLETED'; state.resolution_state = 'RESOLVED'; state.status = 'RESOLVED';
+            for (const action of state.pending_actions)
+              if (action.action_id === 'follow-up-escalation') {
+                action.approval_state = 'REJECTED';
+                action.provider_result = {status: 'superseded', reason: 'incident_resolved'};
+              }
+            state.pending_actions = state.pending_actions.filter(action => action.approval_state === 'PENDING');
             evidence = [{source: 'caregiver_report', description: 'John reported that Dad confirmed taking the morning medication.'}];
           } else if (utterance.includes('awake and responsive')) {
             tool = 'collect_safety_answers';
@@ -309,12 +315,21 @@ async function main() {
   assert.deepEqual(spoken.slice(speechBeforeDeviceConfirmation), ["Done. Dad's kitchen smart plug is now off."]);
   assert.doesNotMatch(spoken.at(-1), /care concern|caregiver check/i);
   assert.equal(state.medication_status, 'unresolved');
+  state.pending_actions = [{
+    action_id: 'follow-up-escalation', type: 'caregiver_alert',
+    description: 'Ask backup caregiver John to review the unresolved incident.',
+    approval_required: true, approval_state: 'PENDING', execution_state: 'PENDING',
+  }];
+  context.followUpSnapshot = structuredClone(state);
+  vm.runInContext('renderIncidentState(followUpSnapshot)', context);
+  assert.match(shown('#actions'), /Ask backup caregiver John to review the unresolved incident/);
   await dispatch('John checked on Dad. Dad is okay and confirmed he already took his morning medication.');
   assert.match(shown('#summary-grid'), /Medication: taken/);
   assert.match(shown('#summary-grid'), /Caregiver task: COMPLETED/);
   assert.match(shown('#state-cards'), /Incident — Resolved/);
   assert.equal(shown('#actions'), '');
   assert.equal(vm.runInContext('conversation.pending_actions.length', context), 0);
+  assert.equal(vm.runInContext('lastPromptedAction', context), null);
   assert.match(spoken.at(-1), /caregiver task is complete/);
   assert.equal(state.home_smart_plug, 'off');
   await dispatch("What's the status of Dad's incident?");
@@ -329,6 +344,24 @@ async function main() {
 
   // A separate open incident's one-shot due-time notification refreshes the authoritative status once.
   state.resolution_state = 'OPEN'; state.status = 'OPEN';
+  await vm.runInContext('refreshIncident(incidentId)', context);
+  const collisionTimer = timers.at(-1);
+  const beforeCollision = calls.length;
+  const speechBeforeCollision = spoken.length;
+  vm.runInContext('foregroundWork = 1', context);
+  await collisionTimer.fn();
+  assert.equal(calls.length, beforeCollision, 'background refresh must not start competing MCP work');
+  assert.ok(vm.runInContext('deferredFollowUpRefresh !== null', context));
+  assert.doesNotMatch(shown('#error'), /already working/i);
+  assert.equal(spoken.length, speechBeforeCollision);
+  state.status = 'FOLLOW_UP_DUE'; state.next_check_at = null;
+  context.dueSnapshot = structuredClone(state);
+  vm.runInContext('renderIncidentState(dueSnapshot); endForegroundWork()', context);
+  assert.equal(vm.runInContext('deferredFollowUpRefresh', context), null, 'authoritative foreground state must coalesce the deferred read');
+  assert.equal(calls.length, beforeCollision);
+
+  state.resolution_state = 'OPEN'; state.status = 'OPEN';
+  state.next_check_at = new Date(Date.now() + 60000).toISOString();
   await vm.runInContext('refreshIncident(incidentId)', context);
   const timer = timers.at(-1);
   assert.ok(timer && timer.delay > 0);

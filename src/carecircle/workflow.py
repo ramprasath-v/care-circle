@@ -32,6 +32,17 @@ def policy_decision(risk_class: str, approved: bool) -> str:
     }[risk_class]
 
 
+def supersede_follow_up_escalation(store: StateStore, incident_id: str) -> bool:
+    """Retain a due follow-up in history, but make it non-actionable after resolution."""
+    action = store.get_action(incident_id, "follow-up-escalation")
+    if not action or action.get("approval_state") != "PENDING":
+        return False
+    action["approval_state"] = "REJECTED"
+    action["provider_result"] = {"status": "superseded", "reason": "incident_resolved"}
+    store.update_action(incident_id, action["action_id"], action)
+    return True
+
+
 class ActionWorkflow:
     def __init__(self, store: StateStore, alerts: AlertProvider, scheduler: SchedulerProvider, ring: RingProvider, *, demo_mode: bool = True):
         self.store, self.alerts, self.scheduler, self.ring = store, alerts, scheduler, ring
@@ -153,6 +164,7 @@ def process_follow_up(store: StateStore, household_id: str, incident_id: str) ->
     if not incident or incident["household_id"] != household_id:
         raise KeyError("UnknownIncident")
     if incident["resolution_state"] == "RESOLVED":
+        supersede_follow_up_escalation(store, incident_id)
         incident["next_check_at"] = None
         store.update_incident(incident_id, incident)
         return {"state": "CLOSED", "incident_id": incident_id}

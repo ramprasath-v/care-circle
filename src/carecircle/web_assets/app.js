@@ -88,7 +88,9 @@ let incidentId = null,
   audioContext = null,
   lastPromptedAction = null;
 let followUpTimer = null,
-  scheduledFollowUp = null;
+  scheduledFollowUp = null,
+  deferredFollowUpRefresh = null,
+  foregroundWork = 0;
 const conversation = {
   household_id,
   session_id: null,
@@ -104,6 +106,17 @@ const conversation = {
 let batchApproving = false,
   reviewIndividually = false,
   confirmationSpeechPending = false;
+function beginForegroundWork() {
+  foregroundWork++;
+}
+function endForegroundWork() {
+  foregroundWork = Math.max(0, foregroundWork - 1);
+  if (!foregroundWork && deferredFollowUpRefresh) {
+    const refresh = deferredFollowUpRefresh;
+    deferredFollowUpRefresh = null;
+    followUpTimer = setTimeout(refresh, 0);
+  }
+}
 function syncConversation(interaction) {
   conversation.incident_id = incidentId;
   conversation.pending_actions = pending.map(({ action }) => ({
@@ -518,6 +531,7 @@ function scheduleFollowUpRefresh(value) {
       : value.next_check_at || null;
   if (at === scheduledFollowUp) return;
   if (followUpTimer) clearTimeout(followUpTimer);
+  deferredFollowUpRefresh = null;
   scheduledFollowUp = at;
   followUpTimer = null;
   if (at) {
@@ -526,6 +540,10 @@ function scheduleFollowUpRefresh(value) {
     const readDue = async (attempt) => {
       followUpTimer = null;
       if (incidentId !== id) return;
+      if (busy || foregroundWork) {
+        deferredFollowUpRefresh = () => readDue(attempt);
+        return;
+      }
       try {
         const latest = await refreshIncident(id);
         if (latest.status === "FOLLOW_UP_DUE")
@@ -644,6 +662,7 @@ function renderActions() {
 }
 async function confirm(entry, approved) {
   if (busy || batchApproving) return;
+  beginForegroundWork();
   let succeeded = false;
   try {
     const result = await job("confirm_action", {
@@ -685,10 +704,13 @@ async function confirm(entry, approved) {
     error(
       `${succeeded ? "Action succeeded, but its status could not be refreshed" : "Approval failed"}: ${e.message}`,
     );
+  } finally {
+    endForegroundWork();
   }
 }
 async function confirmAll(approved) {
   if (busy || batchApproving || pending.length < 2) return;
+  beginForegroundWork();
   const selected = pending.map((entry) => ({
     action: { ...entry.action },
     incident_id: entry.incident_id,
@@ -734,6 +756,7 @@ async function confirmAll(approved) {
     batchApproving = false;
     syncConversation("GROUP_APPROVAL");
     renderActions();
+    endForegroundWork();
   }
 }
 async function job(operation, args) {
@@ -864,6 +887,7 @@ function logTurn(source, before, intent) {
 async function dispatch(text, source = "typed") {
   text = text.trim();
   if (!text || batchApproving || busy) return;
+  beginForegroundWork();
   const before = conversation.mode;
   let selectedIntent = "UNROUTED";
   line(text, "user");
@@ -1005,6 +1029,7 @@ async function dispatch(text, source = "typed") {
   } finally {
     syncConversation();
     logTurn(source, before, selectedIntent);
+    endForegroundWork();
   }
 }
 // Web Audio captures signed 16-bit little-endian mono PCM; no browser AWS credentials.

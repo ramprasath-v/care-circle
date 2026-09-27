@@ -11,7 +11,7 @@ from carecircle.progress import emit
 from carecircle.schemas import CareRequest, CareResponse, Evidence, HouseholdBriefing, ProposedAction, SafetyAnswers
 from carecircle.state import StateStore, is_current_demo_event
 from carecircle.supervisor import TriageSpecialist, log_event
-from carecircle.workflow import ActionWorkflow
+from carecircle.workflow import ActionWorkflow, supersede_follow_up_escalation
 
 
 AGENT_NAMES = (
@@ -283,6 +283,7 @@ class FullCareCircleSupervisor:
             incident["resolution_state"] = "RESOLVED"
             incident["care_task_status"] = "COMPLETED"
             self.store.update_incident(incident_id, incident)
+            supersede_follow_up_escalation(self.store, incident_id)
             evidence.extend((Evidence(source="caregiver_report", description="John reported that Dad confirmed taking the morning medication."),
                              Evidence(source="care_task", description=f"Morning check is {task.data['task']['status'].lower()}.")))
             summary = "John's check and Dad's reported morning dose were recorded. The caregiver task and incident are resolved; this is a recorded fact, not dosing advice."

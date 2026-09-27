@@ -161,6 +161,29 @@ async def test_resolved_incident_closes_follow_up(full_stack):
     assert not any(e.get("kind") == "follow_up" for e in x.store.list_events("demo-household"))
 
 
+async def test_resolution_supersedes_pending_follow_up_escalation(full_stack):
+    x = full_stack
+    iid = (await x.triage.create_incident("demo-household", "voice-resolution", "Concern")).data["incident"]["incident_id"]
+    assert process_follow_up(x.store, "demo-household", iid)["state"] == "FOLLOW_UP_DUE"
+    assert x.store.get_action(iid, "follow-up-escalation")["approval_state"] == "PENDING"
+
+    await x.supervisor.coordinate(CareRequest(
+        household_id="demo-household", actor_role="caregiver", session_id="voice-resolution",
+        incident_id=iid,
+        utterance="John checked on Dad. Dad is okay and confirmed he already took his morning medication.",
+    ))
+
+    action = x.store.get_action(iid, "follow-up-escalation")
+    status = x.workflow.status("demo-household", iid)
+    assert status.status == status.resolution_state == "RESOLVED"
+    assert status.medication_status == "taken" and status.care_task_status == "COMPLETED"
+    assert action["approval_state"] == "REJECTED"
+    assert action["execution_state"] == "PENDING"
+    assert action["provider_result"] == {"status": "superseded", "reason": "incident_resolved"}
+    assert not status.pending_actions
+    assert any(item.action_id == "follow-up-escalation" for item in status.rejected_actions)
+
+
 async def test_briefing_partial_failure_and_unknown_household(full_stack):
     x = full_stack
     x.supervisor.home.assess = AsyncMock(side_effect=RuntimeError("private provider failure"))

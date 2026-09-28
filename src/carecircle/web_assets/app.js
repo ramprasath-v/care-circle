@@ -91,6 +91,46 @@ let followUpTimer = null,
   scheduledFollowUp = null,
   deferredFollowUpRefresh = null,
   foregroundWork = 0;
+let activeTurnTiming = null,
+  pendingVoiceTiming = null;
+const timingNow = () => Date.now();
+function timingSessionHash() {
+  let hash = 2166136261;
+  for (const char of conversation.session_id || "") {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return conversation.session_id
+    ? (hash >>> 0).toString(16).padStart(8, "0")
+    : null;
+}
+function publishTurnTiming(timing) {
+  if (typeof console === "undefined" || !console.info) return;
+  const origin = timing.recording_end_ms || timing.turn_start_ms;
+  console.info(
+    "carecircle_timing",
+    JSON.stringify({
+      session_hash: timingSessionHash(),
+      source: timing.source,
+      speech_to_text_ms:
+        timing.transcribe_end_ms && timing.transcribe_request_start_ms
+          ? timing.transcribe_end_ms - timing.transcribe_request_start_ms
+          : null,
+      jobs: timing.jobs,
+      state_refreshes: timing.state_refreshes,
+      working_false_ms: timing.working_false_ms
+        ? timing.working_false_ms - origin
+        : null,
+      polly_ms:
+        timing.polly_end_ms && timing.polly_start_ms
+          ? timing.polly_end_ms - timing.polly_start_ms
+          : null,
+      total_to_audio_start_ms: timing.audio_start_ms
+        ? timing.audio_start_ms - origin
+        : null,
+    }),
+  );
+}
 const conversation = {
   household_id,
   session_id: null,
@@ -272,6 +312,8 @@ async function jsonPost(path, body) {
 }
 async function speak(text) {
   if (muted || !text) return;
+  const timing = activeTurnTiming;
+  if (timing) timing.polly_start_ms = timingNow();
   status("Speaking…");
   try {
     const response = await fetch("/api/speak", {
@@ -281,6 +323,7 @@ async function speak(text) {
     });
     if (!response.ok) throw new Error("SpeechUnavailable");
     const blob = await response.blob();
+    if (timing) timing.polly_end_ms = timingNow();
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     audioUrl = URL.createObjectURL(blob);
     playedText = text;
@@ -289,6 +332,11 @@ async function speak(text) {
     const audio = new Audio(audioUrl);
     activeAudio = audio;
     await audio.play();
+    if (timing) {
+      timing.audio_start_ms = timingNow();
+      publishTurnTiming(timing);
+      if (activeTurnTiming === timing) activeTurnTiming = null;
+    }
     audio.onended = () => status("Tap to speak");
   } catch (e) {
     if (e.name !== "AbortError")
@@ -562,10 +610,21 @@ function scheduleFollowUpRefresh(value) {
   }
 }
 async function refreshIncident(id) {
+  const turnTiming = activeTurnTiming;
+  const refresh = turnTiming
+    ? { start_ms: timingNow(), operation: "get_incident_status" }
+    : null;
   const value = await job("get_incident_status", {
     household_id,
     incident_id: id,
   });
+  if (refresh) {
+    refresh.end_ms = timingNow();
+    turnTiming.state_refreshes.push({
+      operation: refresh.operation,
+      duration_ms: refresh.end_ms - refresh.start_ms,
+    });
+  }
   renderIncidentState(value);
   return value;
 }
@@ -769,12 +828,18 @@ async function job(operation, args) {
   status("Processing…");
   error("");
   try {
+    const clientTiming = {
+      operation,
+      conversation_request_sent_ms: timingNow(),
+    };
+    if (activeTurnTiming) activeTurnTiming.jobs.push(clientTiming);
     const started = await jsonPost("/api/jobs", {
       operation,
       arguments: conversation.session_id
         ? { ...args, session_id: conversation.session_id }
         : args,
     });
+    clientTiming.app_runner_accepted_ms = timingNow();
     if (started.session_id) conversation.session_id = started.session_id;
     return await new Promise((resolve, reject) => {
       const events = new EventSource(`/api/jobs/${started.job_id}/events`);
@@ -785,17 +850,20 @@ async function job(operation, args) {
         const item = JSON.parse(message.data);
         if (item.type === "progress") progress(item);
         if (item.type === "result") {
+          clientTiming.mcp_result_received_ms = timingNow();
           resultReceived = true;
           resultValue = item.value;
           observedPublic.add(operation);
           counters();
         }
+        if (item.type === "timing") clientTiming.server = item.value;
         if (item.type === "error") {
           settled = true;
           events.close();
           reject(new Error(item.error));
         }
         if (item.type === "done") {
+          clientTiming.progress_settled_ms = timingNow();
           events.close();
           if (!settled) {
             settled = true;
@@ -815,6 +883,7 @@ async function job(operation, args) {
     });
   } finally {
     busy = false;
+    if (activeTurnTiming) activeTurnTiming.working_false_ms = timingNow();
     $("#working-label-text").textContent = "CareCircle is ready";
     $("#working-spinner").hidden = true;
     $("#send").disabled = false;
@@ -887,6 +956,16 @@ function logTurn(source, before, intent) {
 async function dispatch(text, source = "typed") {
   text = text.trim();
   if (!text || batchApproving || busy) return;
+  activeTurnTiming = {
+    source,
+    turn_start_ms: timingNow(),
+    jobs: [],
+    state_refreshes: [],
+    ...(source === "microphone" && pendingVoiceTiming
+      ? pendingVoiceTiming
+      : {}),
+  };
+  pendingVoiceTiming = null;
   beginForegroundWork();
   const before = conversation.mode;
   let selectedIntent = "UNROUTED";
@@ -1091,6 +1170,7 @@ async function startRecording() {
 async function stopRecording() {
   if (!recording || transcribing) return;
   recording = false;
+  pendingVoiceTiming = { recording_end_ms: timingNow() };
   transcribing = true;
   $("#mic").disabled = true;
   $("#mic").classList.remove("listening");
@@ -1108,12 +1188,14 @@ async function stopRecording() {
       error("Recording was too short. Please try again.");
       return;
     }
+    pendingVoiceTiming.transcribe_request_start_ms = timingNow();
     const response = await fetch("/api/transcribe", {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: blob,
     });
     const result = await response.json();
+    pendingVoiceTiming.transcribe_end_ms = timingNow();
     if (!response.ok) throw new Error(result.error || "Transcription failed");
     await dispatch(result.transcript, "microphone");
   } catch (e) {

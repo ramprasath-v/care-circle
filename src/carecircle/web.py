@@ -16,6 +16,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from carecircle.live_progress import CloudWatchProgressSource
+from carecircle.internal_tools import INTERNAL_TOOL_OWNERS
 from carecircle.remote import RemoteCareCircle
 from carecircle.speech import AmazonPollyProvider, AmazonTranscribeProvider, SpeechToTextProvider, TextToSpeechProvider
 from carecircle.voice_intent import approval_decision
@@ -24,6 +25,11 @@ from carecircle.voice_intent import approval_decision
 INDEX = Path(__file__).resolve().parent / "web_assets" / "index.html"
 SCRIPT = INDEX.with_name("app.js")
 PUBLIC_TOOLS = {"coordinate_care_request", "get_household_briefing", "confirm_action", "get_incident_status"}
+TRACE_TOOL_ALIASES = {
+    "refill_draft": "prepare_refill_request",
+    "ride_draft": "prepare_ride_request",
+    "supply_draft": "prepare_supply_request",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -96,6 +102,7 @@ def create_web_app(remote: RemoteCareCircle | None = None, *,
         return JSONResponse({"decision": approval_decision(transcript, count)})
 
     async def start_job(request):
+        request_received_at = monotonic()
         body = await request.json()
         operation, arguments = body.get("operation"), body.get("arguments", {})
         if operation not in PUBLIC_TOOLS or not isinstance(arguments, dict):
@@ -114,12 +121,18 @@ def create_web_app(remote: RemoteCareCircle | None = None, *,
             await queue.put({"type": "progress", "trace_id": session_id, "component": "AgentCore / MCP",
                              "operation": operation, "status": "RUNNING", "message": "Connecting to CareCircle",
                              "timestamp": datetime.now(timezone.utc).isoformat()})
+            invocation_started_at = monotonic()
             call = asyncio.create_task(asyncio.to_thread(backend.call, operation, arguments))
             source = progress_source
             seen: set[str] = set()
+            observed_records: list[dict] = []
             after_done = 0
             result_sent = False
+            result_sent_at = None
+            agentcore_finished_at = None
             trace_error = False
+            required_progress_seen = operation in {"get_incident_status", "confirm_action"}
+            observed_complete_steps: set[tuple[str, str]] = set()
             briefing_components: set[str] = set()
             briefing_trace_deadline = monotonic() + 45
             while True:
@@ -131,8 +144,15 @@ def create_web_app(remote: RemoteCareCircle | None = None, *,
                         if record["event_id"] in seen:
                             continue
                         seen.add(record["event_id"])
+                        observed_records.append(record)
+                        if record.get("status") == "COMPLETE":
+                            observed_complete_steps.add((record.get("component", ""), record.get("operation", "")))
                         if record["event"] == "mcp_tool_invoked":
                             continue
+                        if (record.get("status") == "COMPLETE" and
+                            ((operation == "coordinate_care_request" and record.get("component") == "CareCircle Supervisor" and record.get("operation") == "coordinate") or
+                             (operation == "confirm_action" and record.get("operation") == "confirm_action"))):
+                            required_progress_seen = True
                         if record.get("status") == "COMPLETE" and record.get("kind") == "tool" and record.get("component") in {
                             "Medication Agent", "Home Safety Agent", "Care Coordinator Agent", "Logistics & Routine Agent"
                         }:
@@ -147,6 +167,8 @@ def create_web_app(remote: RemoteCareCircle | None = None, *,
                                          "status": "FAILED", "message": "Live progress is unavailable; the care request is still running."})
                         trace_error = True
                 if call.done():
+                    if agentcore_finished_at is None:
+                        agentcore_finished_at = monotonic()
                     wait_for_briefing_trace = (operation == "get_household_briefing" and
                                                len(briefing_components) < 4 and not trace_error and
                                                call.exception() is None and monotonic() < briefing_trace_deadline)
@@ -156,14 +178,61 @@ def create_web_app(remote: RemoteCareCircle | None = None, *,
                         except Exception as exc:
                             await queue.put({"type": "error", "error": type(exc).__name__})
                         else:
+                            if operation == "coordinate_care_request" and isinstance(result, dict):
+                                trace = result.get("trace", [])
+                                for step in trace:
+                                    operation_name = TRACE_TOOL_ALIASES.get(step.get("operation"), step.get("operation", ""))
+                                    key = (step.get("component", ""), operation_name)
+                                    if not step.get("success") or key in observed_complete_steps:
+                                        continue
+                                    await queue.put({
+                                        "type": "progress", "trace_id": session_id,
+                                        "component": key[0], "operation": key[1], "status": "COMPLETE",
+                                        "latency_ms": step.get("latency_ms"),
+                                        "kind": "tool" if key[1] in INTERNAL_TOOL_OWNERS else "agent",
+                                        "source": "authoritative_response_trace",
+                                    })
+                                    observed_complete_steps.add(key)
+                                required_progress_seen = bool(trace)
+                            if (operation == "confirm_action" and isinstance(result, dict) and
+                                result.get("provider_result", {}).get("provider") == "sns"):
+                                for operation_name in ("send_approved_alert", "schedule_follow_up_check"):
+                                    key = ("Care Coordinator Agent", operation_name)
+                                    if key in observed_complete_steps:
+                                        continue
+                                    await queue.put({
+                                        "type": "progress", "trace_id": session_id,
+                                        "component": key[0], "operation": key[1], "status": "COMPLETE",
+                                        "kind": "tool", "source": "authoritative_confirmation_result",
+                                    })
+                                    observed_complete_steps.add(key)
                             await queue.put({"type": "result", "operation": operation, "value": result,
                                              "trace_id": session_id})
                         result_sent = True
+                        result_sent_at = monotonic()
                     if result_sent:
                         after_done += 1
-                    if result_sent and (operation == "get_household_briefing" or after_done >= 13):
+                    if result_sent and (operation == "get_household_briefing" or required_progress_seen or
+                                        trace_error or after_done >= 13):
                         break
                 await asyncio.sleep(0.8)
+            completed_at = monotonic()
+            complete_records = [x for x in observed_records if x.get("status") == "COMPLETE"]
+            timing = {
+                "operation": operation,
+                "app_runner_receive_to_mcp_start_ms": round((invocation_started_at-request_received_at)*1000, 2),
+                "agentcore_mcp_ms": round(((agentcore_finished_at or completed_at)-invocation_started_at)*1000, 2),
+                "progress_settle_ms": round((completed_at-(result_sent_at or completed_at))*1000, 2),
+                "server_total_ms": round((completed_at-request_received_at)*1000, 2),
+                "llm_planning_ms": max((x.get("latency_ms", 0) for x in complete_records
+                                        if x.get("operation") == "strands_agents_as_tools_plan"), default=0),
+                "specialists": {x.get("component"): x.get("latency_ms") for x in complete_records
+                                if x.get("kind") == "agent" and x.get("latency_ms") is not None},
+                "private_tools": {x.get("operation"): x.get("latency_ms") for x in complete_records
+                                  if x.get("kind") == "tool" and x.get("latency_ms") is not None},
+            }
+            logger.info(json.dumps({"event": "carecircle_web_timing", "session_id": session_id, **timing}))
+            await queue.put({"type": "timing", "value": timing, "trace_id": session_id})
             await queue.put({"type": "done"})
 
         asyncio.create_task(run())

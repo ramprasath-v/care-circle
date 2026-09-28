@@ -201,8 +201,9 @@ async function main() {
     assert.equal(calls.filter(name => name === 'coordinate_care_request').length, 2);
     assert.equal(calls.filter(name => name === 'confirm_action').length, 1);
     assert.ok([...jobs.values()].every(job => !job.arguments.session_id || job.arguments.session_id === 'voice-browser-demo'));
-    assert.equal(diagnostics.length, 3);
-    assert.deepEqual(diagnostics.map(([,entry]) => JSON.parse(entry).selected_intent), ['NEW_CONCERN','SAFETY_ANSWER','APPROVE']);
+    const turns = diagnostics.filter(([name]) => name === 'carecircle_turn');
+    assert.equal(turns.length, 3);
+    assert.deepEqual(turns.map(([,entry]) => JSON.parse(entry).selected_intent), ['NEW_CONCERN','SAFETY_ANSWER','APPROVE']);
     return;
   }
   const briefingPhrases = [
@@ -380,8 +381,13 @@ async function main() {
   assert.doesNotMatch(spoken.at(-1), /FOLLOW_UP_DUE|Follow-up:/);
   assert.equal(calls.filter(name => name === 'confirm_action').length, 5);
   assert.ok(spoken.every(text => !/MCP|SNS|EventBridge|ActionLedger|\b(?:OPEN|COMPLETED|FOLLOW_UP_DUE)\b/.test(text)));
-  assert.ok(diagnostics.length >= 3);
-  assert.ok(diagnostics.every(([name, value]) => name === 'carecircle_turn' && JSON.parse(value).source === (microphone ? 'microphone' : 'typed')));
+  const turnDiagnostics = diagnostics.filter(([name]) => name === 'carecircle_turn');
+  const timingDiagnostics = diagnostics.filter(([name]) => name === 'carecircle_timing');
+  assert.ok(turnDiagnostics.length >= 3);
+  assert.ok(turnDiagnostics.every(([, value]) => JSON.parse(value).source === (microphone ? 'microphone' : 'typed')));
+  assert.ok(timingDiagnostics.length >= 3);
+  assert.ok(timingDiagnostics.some(([, value]) => JSON.parse(value).jobs.length >= 1));
+  assert.ok(timingDiagnostics.every(([, value]) => JSON.parse(value).total_to_audio_start_ms >= 0));
   assert.ok(diagnostics.every(([, value]) => !value.includes('Dad just called') && !value.includes('awake and responsive')));
 }
 main().catch(error => {console.error(error); process.exitCode = 1});
